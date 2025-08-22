@@ -1,0 +1,25 @@
+modules:
+  jira:issuePanel:
+    - key: task-deadline-warning-hello-world-issue-panel
+      resource: main
+      resolver:
+        function: resolver
+      render: native
+      title: Task Deadline Warning
+      icon: https://developer.atlassian.com/platform/forge/images/icons/issue-panel-icon.svg
+  function:
+    - key: resolver
+      handler: index.handler
+resources:
+  - key: main
+    path: src/frontend/index.jsx
+app:
+  runtime:
+    name: nodejs22.x
+    memoryMB: 256
+    architecture: arm64
+  id: ari:cloud:ecosystem::app/6f137dc9-1a67-4fbe-b85f-995f31c5d806
+permissions:
+  scopes:
+    - read:jira-work
+    - write:jira-work
