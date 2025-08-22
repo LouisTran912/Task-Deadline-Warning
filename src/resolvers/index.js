@@ -1,22 +1,62 @@
+/**
+ * Task ETA & Risk — Resolvers (Concise documented)
+ *
+ * What it does:
+ * - Stores a per-issue estimate (remainingHours and/or etaISO) in a Jira Issue Property.
+ * - Computes per-issue risk: compares ETA/remaining to the issue duedate.
+ * - Computes portfolio risk: sums all open assigned issues' estimates vs. time budget to the furthest duedate.
+ *
+ * Storage:
+ * - Issue Property key: com.tasketa.estimate (small JSON, no external DB).
+ *
+ * Endpoints:
+ * - getIssueRisk(issueKey?): { issueKey, summary, duedate, estimate, risk, portfolio }
+ * - saveEstimate({ issueKey, remainingHours?, etaISO? }): { ok, estimate, risk } | { error, message }
+ * - getPortfolioRisk(): { ok, portfolio } | { error, message }
+ */
+
 import Resolver from '@forge/resolver';
 import api, { route } from '@forge/api';
 
 const resolver = new Resolver();
+/** Issue Property key used to persist user estimate */
 const PROPERTY_KEY = 'com.tasketa.estimate';
 
-// --- existing helpers ---
+/* -------------------------- helpers: per-issue -------------------------- */
+
+/**
+ * Interpret a date-only duedate (YYYY-MM-DD) as end-of-day UTC ISO string.
+ * @param {string} dateStr - Jira date-only string
+ * @returns {string} ISO string at 23:59:59.999Z
+ */
 function endOfDayISO(dateStr) {
   return new Date(`${dateStr}T23:59:59.999Z`).toISOString();
 }
+
+/**
+ * Compute per-issue risk from now, duedate, and estimate.
+ * Rules:
+ * - NO_DUE: no duedate set.
+ * - UNKNOWN: no ETA nor remainingHours.
+ * - LATE: ETA > due.
+ * - AT_RISK: buffer < 24h.
+ * - OK: otherwise.
+ * @param {string} nowISO
+ * @param {string|undefined} duedateISO
+ * @param {{etaISO?:string, remainingHours?:number}|undefined} est
+ * @returns {{level:'NO_DUE'|'UNKNOWN'|'LATE'|'AT_RISK'|'OK', reason:string}}
+ */
 function calcRisk(nowISO, duedateISO, est) {
   if (!duedateISO) return { level: 'NO_DUE', reason: 'No due date set' };
   const now = new Date(nowISO).getTime();
   const due = new Date(duedateISO).getTime();
+
   let eta = NaN;
   if (est?.etaISO) eta = new Date(est.etaISO).getTime();
   else if (typeof est?.remainingHours === 'number' && est.remainingHours > 0) {
     eta = now + est.remainingHours * 3600_000;
   }
+
   if (Number.isNaN(eta)) return { level: 'UNKNOWN', reason: 'No ETA / remaining hours provided' };
   if (eta > due) return { level: 'LATE', reason: 'ETA exceeds due date' };
   const bufferMs = due - eta;
@@ -24,6 +64,10 @@ function calcRisk(nowISO, duedateISO, est) {
   return { level: 'OK', reason: 'ETA comfortably before due date' };
 }
 
+/**
+ * Read an issue (as the app). Expects Browse permission for the app user.
+ * @param {string} issueKey
+ */
 async function readIssue(issueKey) {
   const res = await api.asApp().requestJira(
       route`/rest/api/3/issue/${issueKey}?fields=summary,duedate,status,assignee`
@@ -35,6 +79,11 @@ async function readIssue(issueKey) {
   }
   return await res.json();
 }
+
+/**
+ * Read the app-owned estimate Issue Property (404 => null).
+ * @param {string} issueKey
+ */
 async function readEstimate(issueKey) {
   const res = await api.asApp().requestJira(
       route`/rest/api/3/issue/${issueKey}/properties/${PROPERTY_KEY}`
@@ -44,6 +93,12 @@ async function readEstimate(issueKey) {
   const body = await res.json();
   return body?.value ?? null;
 }
+
+/**
+ * Write the estimate Issue Property.
+ * @param {string} issueKey
+ * @param {{etaISO?:string, remainingHours?:number, updatedAt:string}} est
+ */
 async function writeEstimate(issueKey, est) {
   const res = await api.asApp().requestJira(
       route`/rest/api/3/issue/${issueKey}/properties/${PROPERTY_KEY}`,
@@ -55,7 +110,15 @@ async function writeEstimate(issueKey, est) {
   }
 }
 
-// --- NEW: helpers for portfolio risk ---
+/* ------------------------ helpers: portfolio rollup --------------------- */
+
+/**
+ * JQL search (as current user) with pagination.
+ * @param {string} jql
+ * @param {string} fields
+ * @param {number} cap
+ * @returns {Promise<Array>} issues
+ */
 async function jqlAllAsUser(jql, fields = 'summary,duedate,status', cap = 10000) {
   // Read issues as the current user (admin in your tests) to avoid 404 perms
   const pageSize = 100;
@@ -74,6 +137,12 @@ async function jqlAllAsUser(jql, fields = 'summary,duedate,status', cap = 10000)
   return all;
 }
 
+/**
+ * Convert an estimate to hours (prefers remainingHours; falls back to etaISO).
+ * @param {{remainingHours?:number, etaISO?:string}|null} est
+ * @param {number} nowMs
+ * @returns {number|null}
+ */
 function hoursFromEstimate(est, nowMs) {
   if (!est) return null;
   if (typeof est.remainingHours === 'number' && est.remainingHours >= 0) {
@@ -87,6 +156,13 @@ function hoursFromEstimate(est, nowMs) {
   return null; // unknown
 }
 
+/**
+ * Compute portfolio risk for current user:
+ * - Budget = (furthest duedate across open assigned issues) - now
+ * - Total  = sum of estimated hours (remainingHours or hours from ETA)
+ * Levels: OVERBOOKED (total > budget), TIGHT (buffer < 8h), OK,
+ *         NO_DUE (no open issues have a duedate)
+ */
 async function computePortfolioRisk() {
   // Open issues assigned to current user
   const jql = 'assignee = currentUser() AND statusCategory != Done ORDER BY duedate ASC';
@@ -97,8 +173,8 @@ async function computePortfolioRisk() {
 
   let furthestDueISO = undefined;
   let totalEstimatedHours = 0;
-  let counted = 0; // how many issues contributed hours
-  let unknown = 0; // how many had no estimate
+  let counted = 0; // issues with hours
+  let unknown = 0; // issues without usable estimate
 
   for (const it of items) {
     const key = it.key;
@@ -156,8 +232,12 @@ async function computePortfolioRisk() {
   };
 }
 
-// --- endpoints ---
+/* ------------------------------- endpoints ------------------------------ */
 
+/**
+ * Get per-issue data + portfolio rollup.
+ * @returns {Object} issueKey, summary, duedate, estimate, risk, portfolio | {error, message}
+ */
 resolver.define('getIssueRisk', async (req) => {
   const issueKey = req.payload?.issueKey || req.context?.issue?.key;
   console.log('getIssueRisk keys:', { payload: req.payload, contextIssue: req.context?.issue, picked: issueKey });
@@ -173,7 +253,7 @@ resolver.define('getIssueRisk', async (req) => {
     const dueISO = issue?.fields?.duedate ? endOfDayISO(issue.fields.duedate) : undefined;
     const risk = calcRisk(nowISO, dueISO, est || undefined);
 
-    // NEW: portfolio rollup
+    // Portfolio rollup across the user’s open assigned issues
     const portfolio = await computePortfolioRisk();
 
     return {
@@ -182,7 +262,7 @@ resolver.define('getIssueRisk', async (req) => {
       duedate: issue?.fields?.duedate || null,
       estimate: est,
       risk,
-      portfolio // <-- { level, reason, budgetHours, totalEstimatedHours, ... }
+      portfolio
     };
   } catch (e) {
     const status = e?.status || 500;
@@ -197,7 +277,10 @@ resolver.define('getIssueRisk', async (req) => {
   }
 });
 
-// Save ETA/remaining for the current issue (unchanged)
+/**
+ * Save the estimate for an issue and return updated per-issue risk.
+ * Body: { issueKey, remainingHours?, etaISO? }
+ */
 resolver.define('saveEstimate', async (req) => {
   const key = req.payload?.issueKey || req.context?.issue?.key;
   if (!key) return { error: 'NO_KEY', message: 'No issue key' };
@@ -219,7 +302,9 @@ resolver.define('saveEstimate', async (req) => {
   }
 });
 
-// NEW: direct endpoint if you want a separate "My Task Risks" page
+/**
+ * Get only the portfolio rollup (for standalone views).
+ */
 resolver.define('getPortfolioRisk', async () => {
   try {
     const portfolio = await computePortfolioRisk();
