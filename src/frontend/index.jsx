@@ -3,20 +3,18 @@ import ForgeReconciler, {
     Text, Textfield, Button, SectionMessage, Stack, Strong
 } from '@forge/react';
 import { invoke, view } from '@forge/bridge';
-
+const isIssueOnTrack = (lvl) => !['LATE', 'AT_RISK'].includes(lvl ?? '');
+const isPortfolioOnTrack = (lvl) => !['OVERBOOKED', 'TIGHT'].includes(lvl ?? '');
 const toStringVal = (v) =>
     typeof v === 'string'
         ? v
         : (v && typeof v === 'object' && (v.value ?? v.target?.value ?? '')) || '';
 
+// Per-issue banner: only show when risky
 const RiskBanner = ({ risk }) => {
-    if (!risk || risk.level === 'OK') return null;
-    const appearance =
-        risk.level === 'LATE' ? 'error' :
-            risk.level === 'AT_RISK' ? 'warning' : 'information';
-    const title =
-        risk.level === 'LATE' ? 'Likely to miss deadline' :
-            risk.level === 'AT_RISK' ? 'Potential delay' : 'Info';
+    if (!risk || isIssueOnTrack(risk.level)) return null;
+    const appearance = risk.level === 'LATE' ? 'error' : 'warning';
+    const title = risk.level === 'LATE' ? 'Likely to miss deadline' : 'Potential delay';
     return (
         <SectionMessage title={title} appearance={appearance}>
             <Text>{risk.reason}</Text>
@@ -24,18 +22,13 @@ const RiskBanner = ({ risk }) => {
     );
 };
 
+// Portfolio banner: only show when risky
 const PortfolioBanner = ({ portfolio }) => {
-    if (!portfolio) return null;
-    if (portfolio.level === 'OK') return null;
+    if (!portfolio || isPortfolioOnTrack(portfolio.level)) return null;
 
-    const appearance =
-        portfolio.level === 'OVERBOOKED' ? 'error' :
-            portfolio.level === 'TIGHT' ? 'warning' : 'information';
-
+    const appearance = portfolio.level === 'OVERBOOKED' ? 'error' : 'warning';
     const fmtH = (n) => (typeof n === 'number' && isFinite(n) ? `${n.toFixed(1)} h` : '—');
-    const due = portfolio.furthestDueISO
-        ? new Date(portfolio.furthestDueISO).toLocaleString()
-        : '—';
+    const due = portfolio.furthestDueISO ? new Date(portfolio.furthestDueISO).toLocaleString() : '—';
 
     return (
         <SectionMessage title="Workload risk" appearance={appearance}>
@@ -59,12 +52,9 @@ const PortfolioBanner = ({ portfolio }) => {
     );
 };
 
-// ✅ New: show success when everything is OK
+// Green success banner if both are on track (incl. NO_DUE / UNKNOWN)
 const OnTrackBanner = ({ issueRisk, portfolio }) => {
-    const issueOk = issueRisk?.level === 'OK';
-    const portfolioOk = !portfolio || portfolio.level === 'OK';
-    if (!(issueOk && portfolioOk)) return null;
-
+    if (!isIssueOnTrack(issueRisk?.level) || !isPortfolioOnTrack(portfolio?.level)) return null;
     return (
         <SectionMessage appearance="success" title="Everything is on track">
             <Text>Your current issue and overall workload both look good.</Text>
